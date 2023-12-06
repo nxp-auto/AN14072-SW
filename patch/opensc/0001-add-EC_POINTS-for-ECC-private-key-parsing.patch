@@ -1,0 +1,35 @@
+From b7fed4f47255cc8d3864c0e588a21b3a89b9e763 Mon Sep 17 00:00:00 2001
+From: xuewei wang <xuewei.wang@nxp.com>
+Date: Mon, 17 Jul 2023 14:31:10 +0800
+Subject: [PATCH] add EC_POINTS for ECC private key parsing
+
+---
+ src/tools/pkcs11-tool.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/tools/pkcs11-tool.c b/src/tools/pkcs11-tool.c
+index 6cf069c..b8144fe 100644
+--- a/src/tools/pkcs11-tool.c
++++ b/src/tools/pkcs11-tool.c
+@@ -3845,7 +3845,8 @@ parse_ec_pkey(EVP_PKEY *pkey, int private, struct gostkey_info *gost)
+ 		BN_free(bignum);
+ #endif
+ 	}
+-	else {
++	/* parse parameters of public */
++	{
+ 		unsigned char buf[512], *point;
+ 		size_t point_len, header_len;
+ 		const int MAX_HEADER_LEN = 3;
+@@ -4122,6 +4123,8 @@ static int write_object(CK_SESSION_HANDLE session)
+ 			n_privkey_attr++;
+ 			FILL_ATTR(privkey_templ[n_privkey_attr], CKA_VALUE, gost.private.value, gost.private.len);
+ 			n_privkey_attr++;
++			FILL_ATTR(privkey_templ[n_privkey_attr], CKA_EC_POINT, gost.public.value, gost.public.len);
++			n_privkey_attr++;
+ 		}
+ 		else if (pk_type == NID_id_GostR3410_2001)   {
+ 			type = CKK_GOSTR3410;
+-- 
+2.40.1.windows.1
+

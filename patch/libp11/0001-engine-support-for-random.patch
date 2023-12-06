@@ -1,0 +1,159 @@
+From 6b6f64afe0e5c3c80324170605a319bd186ad491 Mon Sep 17 00:00:00 2001
+From: xuewei wang <xuewei.wang@nxp.com>
+Date: Wed, 24 May 2023 17:13:46 +0800
+Subject: [PATCH] random test pass
+
+---
+ src/Makefile.am |  2 +-
+ src/eng_back.c  | 31 +++++++++++++++++++++++++
+ src/eng_front.c |  7 ++++++
+ src/eng_rng.c   | 61 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 100 insertions(+), 1 deletion(-)
+ create mode 100644 src/eng_rng.c
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 2a9b11e..84672cf 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -34,7 +34,7 @@ else
+ libp11_la_LDFLAGS += -export-symbols "$(srcdir)/libp11.exports"
+ endif
+ 
+-pkcs11_la_SOURCES = eng_front.c eng_back.c eng_parse.c eng_err.c eng_cipher.c\
++pkcs11_la_SOURCES = eng_front.c eng_back.c eng_parse.c eng_err.c eng_cipher.c eng_rng.c\
+ 	engine.h eng_err.h pkcs11.exports
+ if WIN32
+ pkcs11_la_SOURCES += pkcs11.rc
+diff --git a/src/eng_back.c b/src/eng_back.c
+index 94c5d5e..19921e8 100644
+--- a/src/eng_back.c
++++ b/src/eng_back.c
+@@ -626,6 +626,37 @@ void *ctx_load_object(ENGINE_CTX *ctx,
+ 	return obj;
+ }
+ 
++PKCS11_SLOT* ctx_get_slot(ENGINE_CTX *ctx, char *slot_desc)
++{
++	PKCS11_SLOT *slot = NULL;
++	int i;
++
++	pthread_mutex_lock(&ctx->lock);
++
++	/* Delayed libp11 initialization */
++	if (ctx_init_libp11_unlocked(ctx)) {
++		ENGerr(ENG_F_CTX_LOAD_OBJECT, ENG_R_INVALID_PARAMETER);
++		pthread_mutex_unlock(&ctx->lock);
++		return NULL;
++	}
++
++	pthread_mutex_unlock(&ctx->lock);
++
++    /* search for slot */
++    for (i = 0; i < ctx->slot_count; i++) {
++        slot = ctx->slot_list + i;
++        if ((slot->description != NULL) && 
++                (strncmp(slot->description, slot_desc, strlen(slot_desc)) == 0))
++            break;
++    }
++
++    if (i == ctx->slot_count) {
++        return NULL;
++    }
++
++	return slot;
++}
++
+ /******************************************************************************/
+ /* Certificate handling                                                       */
+ /******************************************************************************/
+diff --git a/src/eng_front.c b/src/eng_front.c
+index 006816b..7f2a49c 100644
+--- a/src/eng_front.c
++++ b/src/eng_front.c
+@@ -255,9 +255,16 @@ static int bind_helper(ENGINE *e)
+ 		ret = 1;
+ 	}
+ 
++	if (ret == 0)
++		goto end;
++
+ 	/* block ciphering */
+ 	ret = eng_cipher_bind(e);
++	if (ret == 0)
++		goto end;
+ 
++	ret = eng_rng_bind(e);
++end:
+ 	return ret;
+ }
+ 
+diff --git a/src/eng_rng.c b/src/eng_rng.c
+new file mode 100644
+index 0000000..7189b40
+--- /dev/null
++++ b/src/eng_rng.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: LGPL-2.1-only
++/*
++ * Copyright 2023 NXP
++ */
++#include "libp11-int.h"
++#include "engine.h"
++#include <string.h>
++#include <openssl/evp.h>
++#include <openssl/engine.h>
++
++/* external functions */
++extern ENGINE_CTX *get_ctx(ENGINE *engine);
++PKCS11_SLOT* ctx_get_slot(ENGINE_CTX *ctx, char *slot_desc);
++
++static int pkcs_hse_rand_bytes(unsigned char *buf, int num)
++{
++    ENGINE_CTX *p11_ctx = NULL;
++    PKCS11_SLOT *slot = NULL;
++    char *slot_desc = "NXP-HSE-Slot";
++
++	p11_ctx = get_ctx(NULL);
++	if (p11_ctx == NULL) 
++		return -1;
++
++    slot = ctx_get_slot(p11_ctx, slot_desc);
++    if (slot == NULL)
++        return -1;
++
++    if (!PKCS11_generate_random(slot, buf, num))
++        return 1;
++
++    return -1;
++}
++
++static int pkcs_hse_rand_status(void)
++{
++    return 1;
++}
++
++static const RAND_METHOD *hse_rand_method(void)
++{
++
++    static RAND_METHOD pkcs_hse_rand_meth = {
++        NULL,
++        pkcs_hse_rand_bytes,
++        NULL,
++        NULL,
++        pkcs_hse_rand_bytes,
++        pkcs_hse_rand_status
++    };
++
++    return &pkcs_hse_rand_meth;
++}
++
++int eng_rng_bind(ENGINE *e)
++{
++    if (!ENGINE_set_RAND(e, hse_rand_method()))
++        return 0;
++
++    return 1;
++}
+-- 
+2.40.1.windows.1
+

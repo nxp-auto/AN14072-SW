@@ -1,0 +1,31 @@
+From 39fc2783d48362cf0517cc74af2c393551b8ccce Mon Sep 17 00:00:00 2001
+From: xuewei wang <xuewei.wang@nxp.com>
+Date: Tue, 11 Jul 2023 13:33:38 +0800
+Subject: [PATCH] fix rsa private key parser error
+
+---
+ src/tools/pkcs11-tool.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/tools/pkcs11-tool.c b/src/tools/pkcs11-tool.c
+index aae205f..6cf069c 100644
+--- a/src/tools/pkcs11-tool.c
++++ b/src/tools/pkcs11-tool.c
+@@ -3669,12 +3669,12 @@ parse_rsa_pkey(EVP_PKEY *pkey, int private, struct rsakey_info *rsa)
+ 		RSA_get0_factors(r, &r_p, &r_q);
+ 		RSA_get0_crt_params(r, &r_dmp1, &r_dmq1, &r_iqmp);
+ #else
+-		if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR1, &r_d) != 1 ||
++		if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_D, &r_d) != 1 ||
+ 			EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR1, &r_p) != 1 ||
+ 			EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR2, &r_q) != 1 ||
+ 			EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT1, &r_dmp1) != 1 ||
+ 			EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT2, &r_dmq1) != 1 ||
+-			EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT3, &r_iqmp) != 1) {
++			EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, &r_iqmp) != 1) {
+ 			util_fatal("OpenSSL error during RSA private key parsing");
+ 		}
+ #endif
+-- 
+2.40.1.windows.1
+

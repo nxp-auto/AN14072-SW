@@ -1,0 +1,303 @@
+From 80837524d79c9e993b47862c00bd951862f80c1e Mon Sep 17 00:00:00 2001
+From: xuewei wang <xuewei.wang@nxp.com>
+Date: Tue, 26 Sep 2023 18:12:18 +0800
+Subject: [PATCH] openssl engien example for AES-CBC
+
+---
+ examples/Makefile                  |   4 +-
+ examples/pkcs-engine/Makefile      |  16 ++
+ examples/pkcs-engine/pkcs-engine.c | 243 +++++++++++++++++++++++++++++
+ 3 files changed, 261 insertions(+), 2 deletions(-)
+ create mode 100644 examples/pkcs-engine/Makefile
+ create mode 100644 examples/pkcs-engine/pkcs-engine.c
+
+diff --git a/examples/Makefile b/examples/Makefile
+index 6183117..1a3b95e 100644
+--- a/examples/Makefile
++++ b/examples/Makefile
+@@ -2,8 +2,8 @@
+ # Copyright 2021, 2023 NXP
+ #
+ 
+-examples := pkcs-keyop pkcs-key-provision hse-encrypt hse-sysimg hse-secboot trustzone-key-provision pkcs-cipher pkcs-msg-digest pkcs-sig
+-default_examples := pkcs-keyop pkcs-key-provision hse-encrypt hse-sysimg hse-secboot pkcs-cipher pkcs-msg-digest pkcs-sig
++examples := pkcs-keyop pkcs-key-provision hse-encrypt hse-sysimg hse-secboot trustzone-key-provision pkcs-cipher pkcs-msg-digest pkcs-sig pkcs-engine
++default_examples := pkcs-keyop pkcs-key-provision hse-encrypt hse-sysimg hse-secboot pkcs-cipher pkcs-msg-digest pkcs-sig pkcs-engine
+ clean_examples = $(addprefix clean_,$(default_examples))
+ install_examples = $(addprefix install_,$(default_examples))
+ 
+diff --git a/examples/pkcs-engine/Makefile b/examples/pkcs-engine/Makefile
+new file mode 100644
+index 0000000..7c8056f
+--- /dev/null
++++ b/examples/pkcs-engine/Makefile
+@@ -0,0 +1,16 @@
++#
++# Copyright 2023 NXP
++#
++
++include ../../common.mk
++
++all: pkcs-engine
++
++pkcs-engine: pkcs-engine.c
++	$(CROSS_COMPILE)gcc $(LDFLAGS) $(INCLUDE_LIBPKCS) $(CFLAGS) $^ -o $@ $(LD_OPENSSL) -ldl
++
++clean:
++	rm -f pkcs-engine
++
++install:
++	install pkcs-engine $(EXAMPLES_INSTALLDIR)
+\ No newline at end of file
+diff --git a/examples/pkcs-engine/pkcs-engine.c b/examples/pkcs-engine/pkcs-engine.c
+new file mode 100644
+index 0000000..164d3bb
+--- /dev/null
++++ b/examples/pkcs-engine/pkcs-engine.c
+@@ -0,0 +1,243 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * Copyright 2023 NXP
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++#include <dlfcn.h>
++#include <errno.h>
++#include <openssl/conf.h>
++#include <openssl/engine.h>
++#include <openssl/evp.h>
++#include <openssl/cmac.h>
++
++#include "pkcs11.h"
++
++#ifndef ARRAY_SIZE
++#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
++#endif /* ARRAY_SIZE */
++
++#ifndef ERROR
++#define ERROR(fmt, ...) printf("[ERROR] " fmt, ##__VA_ARGS__)
++#endif
++
++#ifndef INFO
++#define INFO(fmt, ...) printf("[INFO] " fmt, ##__VA_ARGS__)
++#endif
++
++/* Use a buffer size which is not aligned to block size */
++#define BUFFER_SIZE     64
++
++static int test_pkcs11_aes_cbc(ENGINE *e)
++{
++    EVP_CIPHER_CTX *ctx;
++    const EVP_CIPHER *cipher;
++    unsigned char enc[BUFFER_SIZE];
++    unsigned char enc_ref[BUFFER_SIZE];
++    unsigned char dec[BUFFER_SIZE];
++    int enc_len, enc_len_final, dec_len, dec_len_final;
++    static const char key_uri[] = "pkcs11:token=NXP-HSE-Token;object=HSE-AES-128-KEY";
++    /* for test, the key[] value shall be identical with that of the key by key_uri  */
++    static const unsigned char key[] = {0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef};
++    static const unsigned char iv[] = {0x3d, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd};
++    /* input = "Single block msg\n" 17 Bytes*/
++    static const unsigned char in[BUFFER_SIZE] =
++        "\x53\x69\x6e\x67\x6c\x65\x20\x62\x6c\x6f\x63\x6b\x20\x6d\x73\x67";
++    unsigned char *key_test;
++    int i;
++    int ret = 0;
++
++#ifdef OSSL_SANITIZE_MEMORY
++    /*
++     * Initialise the encryption & decryption buffers to pacify the memory
++     * sanitiser.  The sanitiser doesn't know that this memory is modified
++     * by the engine, this tells it that all is good.
++     */
++    OPENSSL_cleanse(ebuf, sizeof(ebuf));
++    OPENSSL_cleanse(dbuf, sizeof(dbuf));
++#endif
++
++
++    cipher = EVP_aes_128_cbc();
++
++	ctx = EVP_CIPHER_CTX_new();
++    if (ctx == NULL)
++            return -1;
++
++    /* calc the ref using software */
++    INFO("Start encryption using libcrypto...\n");
++    if (!(EVP_CIPHER_CTX_reset(ctx))
++            || !(EVP_CipherInit_ex(ctx, cipher, NULL, key, iv, 1))
++            || !(EVP_CipherUpdate(ctx, enc_ref, &enc_len, in, BUFFER_SIZE))
++            || !(EVP_CipherFinal_ex(ctx, enc_ref + enc_len, &enc_len_final))) {
++        ERROR("Decryption ref calc error.\n");
++        ret = -1;
++        goto end;
++    }
++    INFO(" [done]\n");
++
++    key_test = (unsigned char *) key_uri;
++    for (i = 0; i < 2; i++) {
++
++        if (i == 1) {
++            key_test = key;
++            INFO("----fallback test...\n");
++        }
++
++        INFO("Start encryption using engine...\n");
++        if (!(EVP_CIPHER_CTX_reset(ctx))
++                || !(EVP_CipherInit_ex(ctx, cipher, e, key_test, iv, 1))
++                || !(EVP_CipherUpdate(ctx, enc, &enc_len, in, BUFFER_SIZE))
++                || !(EVP_CipherFinal_ex(ctx, enc + enc_len, &enc_len_final))) {
++            ERROR("Encryption calc error.\n");
++            ret = -1;
++            goto end;
++        }
++        enc_len += enc_len_final;
++        INFO(" [done]\n");
++
++        if (memcmp(enc, enc_ref, enc_len) == 0)
++            INFO("Encryption data correct.\n");
++        else 
++            ERROR("Encryption data error!\n");
++
++        INFO("Start Decryption using engine...\n");
++        if (!(EVP_CIPHER_CTX_reset(ctx))
++                || !(EVP_CipherInit_ex(ctx, cipher, e, key_test, iv, 0))
++                || !(EVP_CipherUpdate(ctx, dec, &dec_len, enc, enc_len))
++                || !(EVP_CipherFinal_ex(ctx, dec + dec_len, &dec_len_final))) {
++            ERROR("Decryption calc error.\n");
++            ret = -1;
++            goto end;
++        }
++        dec_len += dec_len_final;
++        INFO(" [done]\n");
++
++        if (memcmp(dec, in, BUFFER_SIZE) == 0)
++            INFO("Decryption data correct.\n");
++        else 
++            ERROR("Decryption data error!\n");
++    }
++
++ end:
++    EVP_CIPHER_CTX_free(ctx);
++    return ret;
++}
++
++#pragma GCC optimize ("O0")
++static int test_cmac(ENGINE *e)
++{
++    CMAC_CTX *ctx = NULL;
++    const unsigned char key_uri[] = "pkcs11:token=NXP-HSE-Token;object=HSE-AES-128-KEY";
++    /* for test, the key[] value shall be identical with that of the key by key_uri  */
++    const unsigned char key[] = {0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef};
++    const char *data = "My test data ... Verification is required!";
++    int data_len = 0;
++    unsigned char cmac_ref[16] = {0};
++    unsigned char cmac[16] = {0};
++    int len = 16;
++    int ret = 0;
++
++    data_len = strlen(data);
++
++    ctx = CMAC_CTX_new();
++    if (!ctx)
++        return -1;
++
++    INFO("----Start CMAC calc using engine...\n");
++    if (!(CMAC_Init(ctx, key, 16, EVP_aes_128_cbc(), NULL)) 
++            || !(CMAC_Update(ctx, data, data_len))
++            || !(CMAC_Final(ctx, cmac_ref, &len))) {
++        ERROR("CMAC error!\n");
++        ret = -1;
++        goto end;
++    }
++    INFO(" [done]\n");
++
++    CMAC_CTX_cleanup(ctx);
++
++    len = 16;
++    INFO("Start CMAC calc using engine...\n");
++    if (!(CMAC_Init(ctx, key_uri, 16, EVP_aes_128_cbc(), e)) 
++            || !(CMAC_Update(ctx, data, data_len))
++            || !(CMAC_Final(ctx, cmac, &len))) {
++        ERROR("CMAC error!\n");
++        ret = -2;
++        goto end;
++    }
++    INFO(" [done]\n");
++
++    if (memcmp(cmac_ref, cmac, 16) == 0) {
++        INFO("CMAC output correct.\n");
++    } else 
++        ERROR("CMAC output error.\n");
++
++    CMAC_CTX_cleanup(ctx);
++
++    len = 16;
++    INFO("Start CMAC calc using engine [fallback]...\n");
++    if (!(CMAC_Init(ctx, key, 16, EVP_aes_128_cbc(), e)) 
++            || !(CMAC_Update(ctx, data, data_len))
++            || !(CMAC_Final(ctx, cmac, &len))) {
++        ERROR("CMAC error!\n");
++        ret = -3;
++        goto end;
++    }
++    INFO(" [done]\n");
++
++    if (memcmp(cmac_ref, cmac, 16) == 0) {
++        INFO("CMAC output correct.\n");
++    } else 
++        ERROR("CMAC output error.\n");
++
++end:        
++    CMAC_CTX_free(ctx);
++    return ret;
++}
++
++/* Try to load an engine in a shareable library */
++static ENGINE *try_load_engine(const char *engine)
++{
++    ENGINE *e = ENGINE_by_id("dynamic");
++    if (e) {
++        if (!ENGINE_ctrl_cmd_string(e, "SO_PATH", engine, 0)
++            || !ENGINE_ctrl_cmd_string(e, "LOAD", NULL, 0)) {
++            ENGINE_free(e);
++            e = NULL;
++        }
++    }
++    return e;
++}
++
++int main(int argc, char *argv[])
++{
++	ENGINE *e;
++
++	/* Init openssl lib */
++	OPENSSL_load_builtin_modules();
++	ENGINE_load_dynamic();
++
++	/* Load Configuration */
++	if (CONF_modules_load_file("/etc/ssl/openssl.cnf", "openssl_conf", 0) != 1) {
++		ERROR("Failed to load configuration.\n");
++		return -ENOENT;
++	}
++
++	/* Load pkcs11 engine */
++	if ((e = ENGINE_by_id("pkcs11")) == NULL
++		&& (e = try_load_engine("pkcs11")) == NULL) {
++		ERROR("Can not load pkcs11 engine.\n");
++		return -EINVAL;
++	}
++
++    INFO("AES-CBC engine test...\n");
++	test_pkcs11_aes_cbc(e);
++
++    INFO("CMAC engine test...\n");
++    test_cmac(e);
++
++	return 0;
++}
+-- 
+2.40.1.windows.1
+

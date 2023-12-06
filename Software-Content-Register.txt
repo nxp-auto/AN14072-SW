@@ -1,0 +1,53 @@
+NXP Software Content Register
+
+Release Name:			Software part of AN14072
+Version:				0.1.0
+Outgoing License:		GNU Lesser General Public License v2.1 only
+License File:			LICENSE
+Type of content:		source code
+Description:			Software part of the Application Note 14072; Including patches for open-source softwares.
+Release Location:		https://github.com/nxp-auto
+Origin:					NXP
+
+--------------------------------------------
+
+Component:              patch/opensc
+Version                 0.23.0
+License:                LGPL-2.1-only
+License file:           LICENSE
+Format:                 patch
+Description:            The patch for OpenSC
+Origin:                 NXP
+
+--------------------------------------------
+
+Component:              patch/openssl
+Version                 3.0.8
+License:                Apache License 2.0
+License file:           LICENSE-Apache-2.0.txt
+Format:                 patch
+Description:            The patch for OpenSSL
+Origin:                 NXP
+
+--------------------------------------------
+
+Component:              patch/pkcs11-hse
+Version                 1.0.0
+License:                BSD-3-Clause
+License file:           LICENSE-BSD-3-Clause.txt
+Format:                 patch
+Description:            The patch for PKCS11-HSE
+Origin:                 NXP
+
+
+--------------------------------------------
+
+Component:              tls-demo
+Version                 0.1.0
+License:                BSD-3-Clause
+License file:           LICENSE-BSD-3-Clause.txt
+Format:                 scripts
+Description:            TLS demo bash scripts
+Origin:                 NXP
+
+--------------------------------------------

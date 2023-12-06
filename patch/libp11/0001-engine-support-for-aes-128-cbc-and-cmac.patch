@@ -1,0 +1,674 @@
+From b1215a2b9c3a600f7202d74998674699478af022 Mon Sep 17 00:00:00 2001
+From: xuewei wang <xuewei.wang@nxp.com>
+Date: Fri, 7 Apr 2023 15:44:22 +0800
+Subject: [PATCH] engine support for aes-128-cbc and cmac
+
+---
+ src/Makefile.am  |   2 +-
+ src/eng_back.c   |  16 +-
+ src/eng_cipher.c | 484 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/eng_front.c  |  24 ++-
+ src/libp11.h     |   4 +
+ src/p11_front.c  |   9 +
+ src/p11_key.c    |   2 +
+ 7 files changed, 535 insertions(+), 6 deletions(-)
+ create mode 100644 src/eng_cipher.c
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 1f44226..2a9b11e 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -34,7 +34,7 @@ else
+ libp11_la_LDFLAGS += -export-symbols "$(srcdir)/libp11.exports"
+ endif
+ 
+-pkcs11_la_SOURCES = eng_front.c eng_back.c eng_parse.c eng_err.c \
++pkcs11_la_SOURCES = eng_front.c eng_back.c eng_parse.c eng_err.c eng_cipher.c\
+ 	engine.h eng_err.h pkcs11.exports
+ if WIN32
+ pkcs11_la_SOURCES += pkcs11.rc
+diff --git a/src/eng_back.c b/src/eng_back.c
+index d25e3c1..94c5d5e 100644
+--- a/src/eng_back.c
++++ b/src/eng_back.c
+@@ -588,7 +588,7 @@ error:
+ 	return object;
+ }
+ 
+-static void *ctx_load_object(ENGINE_CTX *ctx,
++void *ctx_load_object(ENGINE_CTX *ctx,
+ 		const char *object_typestr,
+ 		void *(*match_func)(ENGINE_CTX *, PKCS11_TOKEN *,
+ 				const unsigned char *, size_t, const char *),
+@@ -858,6 +858,20 @@ static void *match_private_key(ENGINE_CTX *ctx, PKCS11_TOKEN *tok,
+ 	return match_key(ctx, "private", keys, key_count, obj_id, obj_id_len, obj_label);
+ }
+ 
++void *match_secret_key(ENGINE_CTX *ctx, PKCS11_TOKEN *tok,
++		const unsigned char *obj_id, size_t obj_id_len, const char *obj_label)
++{
++	PKCS11_KEY *keys;
++	unsigned int key_count;
++
++	/* Make sure there is at least one private key on the token */
++	if (PKCS11_enumerate_sec_keys(tok, &keys, &key_count)) {
++		ctx_log(ctx, 0, "Unable to enumerate secret keys\n");
++		return 0;
++	}
++	return match_key(ctx, "secret", keys, key_count, obj_id, obj_id_len, obj_label);
++}
++
+ EVP_PKEY *ctx_load_pubkey(ENGINE_CTX *ctx, const char *s_key_id,
+ 		UI_METHOD *ui_method, void *callback_data)
+ {
+diff --git a/src/eng_cipher.c b/src/eng_cipher.c
+new file mode 100644
+index 0000000..4f96f35
+--- /dev/null
++++ b/src/eng_cipher.c
+@@ -0,0 +1,484 @@
++// SPDX-License-Identifier: LGPL-2.1-only
++/*
++ * Copyright 2023 NXP
++ */
++#include "libp11-int.h"
++#include "engine.h"
++#include <string.h>
++#include <openssl/evp.h>
++#include <openssl/engine.h>
++
++/* external functions */
++extern ENGINE_CTX *get_ctx(ENGINE *engine);
++
++extern void *ctx_load_object(ENGINE_CTX *ctx,
++		const char *object_typestr,
++		void *(*match_func)(ENGINE_CTX *, PKCS11_TOKEN *,
++				const unsigned char *, size_t, const char *),
++		const char *object_uri, UI_METHOD *ui_method, void *callback_data);
++
++extern void *match_secret_key(ENGINE_CTX *ctx, PKCS11_TOKEN *tok,
++		const unsigned char *obj_id, size_t obj_id_len, const char *obj_label);
++
++#define AES_BLOCK_SIZE  (16)
++#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
++
++static int block_cipher_nids[] = {
++    NID_aes_128_cbc,
++    NID_aes_192_cbc,
++    NID_aes_256_cbc
++};
++
++struct block_cipher_attr {
++    int block_size;
++    unsigned int cipher_mode;
++    int key_size;
++    int iv_length;
++};
++
++static struct block_cipher_attr block_cipher_data[ARRAY_SIZE(block_cipher_nids)] = {
++    {AES_BLOCK_SIZE, EVP_CIPH_CBC_MODE, 16, 16},   /* NID_aes_128_cbc */
++    {AES_BLOCK_SIZE, EVP_CIPH_CBC_MODE, 24, 16},   /* NID_aes_192_cbc */
++    {AES_BLOCK_SIZE, EVP_CIPH_CBC_MODE, 32, 16}    /* NID_aes_256_cbc */
++};
++
++static EVP_CIPHER *block_cipher_hidden[ARRAY_SIZE(block_cipher_nids)] = { NULL, };
++
++struct block_ciphering_ctx {
++	ENGINE_CTX *p11_ctx;
++	PKCS11_KEY *p11_key;
++    int fallback;
++    void *inner_cipher_data;
++
++    PKCS11_SLOT_private *slot;
++    CK_SESSION_HANDLE session;
++    CK_MECHANISM mechanism;
++};
++
++/* 
++ * PKCS11 implementations 
++ */
++static int pkcs_cipher_init(EVP_CIPHER_CTX *ctx, struct block_ciphering_ctx *bc_ctx, const unsigned char *iv, int re_init)
++{
++    PKCS11_OBJECT_private *key_priv;
++	PKCS11_SLOT_private *slot;
++    PKCS11_SLOT *p11_slot = NULL;
++    PKCS11_CTX_private *ctx_priv;
++    CK_SESSION_HANDLE session;
++    CK_MECHANISM *mechanism;
++    int rv = 0;
++
++    if ((bc_ctx == NULL) || (bc_ctx->p11_key == NULL))
++        return 0;
++
++    key_priv = PRIVKEY(bc_ctx->p11_key);
++    if (check_object_fork(key_priv) < 0)
++        return 0;
++    
++    slot = key_priv->slot;
++    if (!slot)
++        return 0;
++
++    ctx_priv = slot->ctx;
++    if (!ctx_priv)
++        return 0;
++
++    if (re_init) {
++        /* use the recorded session */
++        session = bc_ctx->session;  
++
++        if (EVP_CIPHER_CTX_encrypting(ctx)) {
++            /* encryption */
++            rv = CRYPTOKI_call(ctx_priv,
++                C_EncryptInit(session, NULL, NULL));
++        } else {
++            /* decryption */
++            rv = CRYPTOKI_call(ctx_priv,
++                C_DecryptInit(session, NULL, NULL));
++        }
++
++        if (rv != CKR_OK) {
++            ctx_log(bc_ctx->p11_ctx, 0, "pkcs11 encrypt/decrypt re-init returned error: %d\n", rv);
++        }
++    } else {
++        if (pkcs11_get_session(slot, 0, &session))
++            return 0;
++    }
++    
++    mechanism = &bc_ctx->mechanism;
++    switch (EVP_CIPHER_CTX_nid(ctx)) {
++        case NID_aes_128_cbc:
++        case NID_aes_192_cbc:
++        case NID_aes_256_cbc:
++            mechanism->mechanism = CKM_AES_CBC;
++            mechanism->pParameter = (void *)iv;
++            mechanism->ulParameterLen = 16;  /* equal to AES block size */
++            break;
++        default:
++            goto end;
++            break;
++    }
++
++    if (EVP_CIPHER_CTX_encrypting(ctx)) {
++        /* encryption */
++        rv = CRYPTOKI_call(ctx_priv,
++            C_EncryptInit(session, mechanism, key_priv->object));
++    } else {
++        /* decryption */
++        rv = CRYPTOKI_call(ctx_priv,
++            C_DecryptInit(session, mechanism, key_priv->object));
++    }
++
++    if (rv != CKR_OK) {
++        ctx_log(bc_ctx->p11_ctx, 0, "pkcs11 encrypt/decrypt init returned error: %d\n", rv);
++        goto end;
++    }
++
++    bc_ctx->slot = slot;
++    bc_ctx->session = session;
++    
++    return 1;
++
++end:
++    pkcs11_put_session(slot, session);
++    return 0;
++}
++
++static int pkcs_cipher_do(EVP_CIPHER_CTX *ctx, struct block_ciphering_ctx *bc_ctx, unsigned char *out, const unsigned char *in, size_t inl)
++{
++	PKCS11_SLOT_private *slot;
++    PKCS11_CTX_private *ctx_priv;
++    int rv = 0;
++    CK_LONG length;
++	
++	slot = bc_ctx->slot;
++    if (!slot)
++        return -1;
++
++    ctx_priv = slot->ctx;
++    if (!ctx_priv)
++        goto end;
++
++    if (EVP_CIPHER_CTX_encrypting(ctx)) {
++        /* encryption */
++        if ((inl == 0) && (in == NULL)) {
++            length = AES_BLOCK_SIZE;
++            rv = CRYPTOKI_call(ctx_priv,
++                C_EncryptFinal(bc_ctx->session, out, &length));
++        } else {
++            length = inl;
++            rv = CRYPTOKI_call(ctx_priv,
++                C_EncryptUpdate(bc_ctx->session, (CK_BYTE_PTR)in, inl, out, &length));
++        }
++    } else {
++        /* decryption */
++        if ((inl == 0) && (in == NULL)) {
++            length = AES_BLOCK_SIZE;
++            rv = CRYPTOKI_call(ctx_priv,
++                C_DecryptFinal(bc_ctx->session, out, &length));
++        } else {
++            length = inl;
++            rv = CRYPTOKI_call(ctx_priv,
++                C_DecryptUpdate(bc_ctx->session, (CK_BYTE_PTR)in, inl, out, &length));
++        }
++    }
++
++    if (rv != CKR_OK) {
++        ctx_log(bc_ctx->p11_ctx, 0, "pkcs11 encrypt/decrypt [%d] returned error: %d\n", 
++                    EVP_CIPHER_CTX_encrypting(ctx), rv);
++        goto end;
++    }
++    
++    return length;
++
++end:
++    pkcs11_put_session(slot, bc_ctx->session);
++    return -1;
++}
++
++static int pkcs_cipher_cleanup(struct block_ciphering_ctx *bc_ctx)
++{
++    if (bc_ctx->slot != NULL)
++        pkcs11_put_session(bc_ctx->slot, bc_ctx->session);
++
++    return 1;
++}
++
++
++static int fb_init(EVP_CIPHER_CTX *ctx, const unsigned char *key,
++                       const unsigned char *iv, int enc)
++{
++    int ret;
++    struct block_ciphering_ctx *bc_ctx;
++    const EVP_CIPHER *cipher;
++
++    bc_ctx = (struct block_ciphering_ctx *)EVP_CIPHER_CTX_get_cipher_data(ctx);
++	if (NULL == bc_ctx)
++		return 0;
++
++    cipher = EVP_aes_128_cbc();
++
++    if (bc_ctx->inner_cipher_data == NULL
++            && EVP_CIPHER_impl_ctx_size(cipher) != 0) {
++        bc_ctx->inner_cipher_data = OPENSSL_zalloc(
++            EVP_CIPHER_impl_ctx_size(cipher));
++        if (bc_ctx->inner_cipher_data == NULL) {
++            return 0;
++        }
++    }
++
++    EVP_CIPHER_CTX_set_cipher_data(ctx, bc_ctx->inner_cipher_data);
++    ret = EVP_CIPHER_meth_get_init(cipher)(ctx, key, iv, enc);
++    EVP_CIPHER_CTX_set_cipher_data(ctx, bc_ctx);
++
++    return ret;
++}
++
++/*
++ * WA to get engine pointer from EVP_CIPHER_CTX
++ */
++static ENGINE *get_engine_ptr(EVP_CIPHER_CTX *ctx)
++{
++	unsigned long eng_ptr;
++
++	/*
++	struct evp_cipher_ctx_st {
++		const EVP_CIPHER *cipher;
++		ENGINE *engine;
++		...
++	 */
++	eng_ptr = *(unsigned long *)((unsigned long)ctx + sizeof(void *));
++
++	return (ENGINE *)eng_ptr;
++}
++/* 
++ * Input parameters:
++ * ctx: context
++ * key: object URL
++ * iv: initial vector
++ * enc: encrypt/decrypt
++ */
++static int eng_cipher_init(EVP_CIPHER_CTX *ctx, const unsigned char *key,
++                       const unsigned char *iv, int enc)
++{
++	struct block_ciphering_ctx *bc_ctx;
++	ENGINE_CTX *p11_ctx = NULL;
++	PKCS11_KEY *p11_key = NULL;
++	unsigned long session;
++    int reinit = 0;
++
++	if (ctx == NULL)
++        return 0;
++
++	bc_ctx = (struct block_ciphering_ctx *)EVP_CIPHER_CTX_get_cipher_data(ctx);
++	if (NULL == bc_ctx)
++		return 0;
++
++	p11_ctx = get_ctx(get_engine_ptr(ctx));
++	if (p11_ctx == NULL) 
++		return 0;
++
++    if ((key == NULL) && (bc_ctx->p11_key != NULL)) {
++        reinit = 1;
++        goto re_init;
++    }
++
++	/* locate the key */
++    if (key == NULL)
++        return 1;
++
++    if (strncasecmp(key, "pkcs11:", 7) == 0)
++        p11_key = ctx_load_object(p11_ctx, "secret key", match_secret_key, key,
++            NULL, NULL);
++	if (!p11_key) {
++		ctx_log(p11_ctx, 0, "ctx_load_object returned NULL\n");
++
++        bc_ctx->fallback = 1;
++        return fb_init(ctx, key, iv, enc);
++	}
++
++    bc_ctx->fallback = -1;
++    bc_ctx->p11_ctx = p11_ctx;
++	bc_ctx->p11_key = p11_key;
++
++re_init:
++	/* low level func to call for pkcs11 module */
++	if (!pkcs_cipher_init(ctx, bc_ctx, iv, reinit)) {
++		ctx_log(p11_ctx, 0, "p11_block_cipher_init returned error\n");
++		return 0;
++	}
++
++    return 1;
++}
++
++/*
++ * return the length of enc/dec result
++ */
++static int eng_cipher_do(EVP_CIPHER_CTX *ctx, unsigned char *out,
++                         const unsigned char *in, size_t inl)
++{
++    int ret;
++	struct block_ciphering_ctx *bc_ctx;
++    const EVP_CIPHER *cipher;
++
++	if ((ctx == NULL))
++		return -1;
++
++	bc_ctx = (struct block_ciphering_ctx *)EVP_CIPHER_CTX_get_cipher_data(ctx);
++	if (NULL == bc_ctx)
++		return -1;
++
++    /* Check input length */
++    if ((inl % AES_BLOCK_SIZE) != 0)
++        return -1;
++
++    /* fallback */
++    if (bc_ctx->fallback > 0) {
++        cipher = EVP_aes_128_cbc();
++        EVP_CIPHER_CTX_set_cipher_data(ctx, bc_ctx->inner_cipher_data);
++
++        ret = EVP_CIPHER_meth_get_do_cipher(cipher)
++                                    (ctx, out, in, inl);
++
++        EVP_CIPHER_CTX_set_cipher_data(ctx, bc_ctx);
++
++        if (ret) {
++            return inl;
++        }
++
++        return -1;
++    }
++
++	if ((bc_ctx->p11_ctx == NULL) && (bc_ctx->p11_key == NULL))
++		return -1;
++
++	return pkcs_cipher_do(ctx, bc_ctx, out, in, inl);
++}
++
++static int eng_cipher_cleanup(EVP_CIPHER_CTX *ctx)
++{
++	struct block_ciphering_ctx *bc_ctx;
++    const EVP_CIPHER *cipher;
++
++	bc_ctx = (struct block_ciphering_ctx *)EVP_CIPHER_CTX_get_cipher_data(ctx);
++	if (NULL == bc_ctx)
++		return 0;
++
++    if (bc_ctx->fallback > 0) {
++        cipher = EVP_aes_128_cbc();
++        OPENSSL_clear_free(bc_ctx->inner_cipher_data,
++                        EVP_CIPHER_impl_ctx_size(cipher));
++    }
++
++    return pkcs_cipher_cleanup(bc_ctx);
++}
++
++
++static int eng_cipher_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg, void *ptr)
++{
++    const EVP_CIPHER *cipher;
++    struct block_ciphering_ctx *bc_ctx;
++
++	bc_ctx = (struct block_ciphering_ctx *)EVP_CIPHER_CTX_get_cipher_data(ctx);
++	if (NULL == bc_ctx)
++		return 0;
++
++    switch (type) {
++        case EVP_CTRL_COPY:
++            {
++                EVP_CIPHER *cipher = EVP_aes_128_cbc();
++                size_t sz = EVP_CIPHER_impl_ctx_size(cipher);
++                void *inner_cipher_data = OPENSSL_malloc(sz);
++
++                if (inner_cipher_data == NULL)
++                    return -1;
++                memcpy(inner_cipher_data, bc_ctx->inner_cipher_data, sz);
++                bc_ctx->inner_cipher_data = inner_cipher_data;
++            }
++            break;
++        default:
++            return 0;
++    }
++
++    return 1;
++}
++
++static const EVP_CIPHER *cipher_aes_cbc(int nid)
++{
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(block_cipher_nids); i++) {
++        if (block_cipher_nids[i] == nid)
++            break;
++    }
++
++    if (i == ARRAY_SIZE(block_cipher_nids))
++        return NULL;
++
++    if ((block_cipher_hidden[i] = 
++            EVP_CIPHER_meth_new(block_cipher_nids[i], 
++                    block_cipher_data[i].block_size, 
++                    block_cipher_data[i].key_size)) == NULL) {
++        printf("Error: EVP_CIPHER_meth_new fail.\n");
++        return 0;
++    }
++
++    if (!EVP_CIPHER_meth_set_iv_length(block_cipher_hidden[i],
++                                            block_cipher_data[i].iv_length)
++        || !EVP_CIPHER_meth_set_flags(block_cipher_hidden[i],
++                                        EVP_CIPH_FLAG_CUSTOM_CIPHER |
++                                        EVP_CIPH_FLAG_DEFAULT_ASN1 |
++                                        EVP_CIPH_CBC_MODE |
++                                        EVP_CIPH_CUSTOM_COPY |
++                                        EVP_CIPH_NO_PADDING |
++                                        EVP_CIPH_ALWAYS_CALL_INIT)
++        || !EVP_CIPHER_meth_set_init(block_cipher_hidden[i], eng_cipher_init)
++        || !EVP_CIPHER_meth_set_do_cipher(block_cipher_hidden[i], eng_cipher_do)
++        || !EVP_CIPHER_meth_set_cleanup(block_cipher_hidden[i],
++                                        eng_cipher_cleanup)
++        || !EVP_CIPHER_meth_set_ctrl(block_cipher_hidden[i],
++                                         eng_cipher_ctrl)
++        || !EVP_CIPHER_meth_set_impl_ctx_size(block_cipher_hidden[i],
++                                                sizeof(struct block_ciphering_ctx))) {
++
++        EVP_CIPHER_meth_free(block_cipher_hidden[i]);
++        block_cipher_hidden[i] = NULL;
++
++        return 0;
++    }
++
++    return block_cipher_hidden[i];
++}
++
++static int block_ciphers(ENGINE *e, const EVP_CIPHER **cipher,
++                             const int **nids, int nid)
++{
++    int ok = 1;
++    if (!cipher) {
++        /* We are returning a list of supported nids */
++        *nids = block_cipher_nids;
++        return (sizeof(block_cipher_nids) - 1)
++               / sizeof(block_cipher_nids[0]);
++    }
++    /* We are being asked for a specific cipher */
++    switch (nid) {
++    case NID_aes_128_cbc:
++    case NID_aes_192_cbc:
++    case NID_aes_256_cbc:
++        *cipher = cipher_aes_cbc(nid);
++        break;
++    default:
++        ok = 0;
++        *cipher = NULL;
++        break;
++    }
++    return ok;
++}
++
++int eng_cipher_bind(ENGINE *e)
++{
++    if (!ENGINE_set_ciphers(e, block_ciphers))
++        return 0;
++
++    return 1;
++}
+diff --git a/src/eng_front.c b/src/eng_front.c
+index 3a3c891..006816b 100644
+--- a/src/eng_front.c
++++ b/src/eng_front.c
+@@ -29,6 +29,10 @@
+ #define PKCS11_ENGINE_NAME "pkcs11 engine"
+ 
+ static int pkcs11_idx = -1;
++static ENGINE_CTX *g_eng_ctx = NULL;
++
++/* Functions for block-ciphering */
++extern int eng_cipher_bind(ENGINE *e);
+ 
+ /* The definitions for control commands specific to this engine */
+ 
+@@ -82,7 +86,7 @@ static const ENGINE_CMD_DEFN engine_cmd_defns[] = {
+ 	{0, NULL, NULL, 0}
+ };
+ 
+-static ENGINE_CTX *get_ctx(ENGINE *engine)
++ENGINE_CTX *get_ctx(ENGINE *engine)
+ {
+ 	ENGINE_CTX *ctx;
+ 
+@@ -92,11 +96,16 @@ static ENGINE_CTX *get_ctx(ENGINE *engine)
+ 			return NULL;
+ 		ctx = NULL;
+ 	} else {
+-		ctx = ENGINE_get_ex_data(engine, pkcs11_idx);
++		if (engine != NULL)
++			ctx = ENGINE_get_ex_data(engine, pkcs11_idx);
++		else 
++			ctx = g_eng_ctx;
+ 	}
+ 	if (!ctx) {
+ 		ctx = ctx_new();
+ 		ENGINE_set_ex_data(engine, pkcs11_idx, ctx);
++
++		g_eng_ctx = ctx;
+ 	}
+ 	return ctx;
+ }
+@@ -212,6 +221,8 @@ static int engine_ctrl(ENGINE *engine, int cmd, long i, void *p, void (*f) ())
+  * "dynamic" ENGINE support too */
+ static int bind_helper(ENGINE *e)
+ {
++	int ret = 0;
++
+ 	if (!ENGINE_set_id(e, PKCS11_ENGINE_ID) ||
+ 			!ENGINE_set_destroy_function(e, engine_destroy) ||
+ 			!ENGINE_set_init_function(e, engine_init) ||
+@@ -238,11 +249,16 @@ static int bind_helper(ENGINE *e)
+ 			!ENGINE_set_pkey_meths(e, PKCS11_pkey_meths) ||
+ 			!ENGINE_set_load_pubkey_function(e, load_pubkey) ||
+ 			!ENGINE_set_load_privkey_function(e, load_privkey)) {
+-		return 0;
++		ret = 0;
+ 	} else {
+ 		ERR_load_ENG_strings();
+-		return 1;
++		ret = 1;
+ 	}
++
++	/* block ciphering */
++	ret = eng_cipher_bind(e);
++
++	return ret;
+ }
+ 
+ static int bind_fn(ENGINE *e, const char *id)
+diff --git a/src/libp11.h b/src/libp11.h
+index bd47d67..5b1562a 100644
+--- a/src/libp11.h
++++ b/src/libp11.h
+@@ -274,6 +274,10 @@ extern int PKCS11_remove_key(PKCS11_KEY *);
+ extern int PKCS11_enumerate_public_keys(PKCS11_TOKEN *,
+ 	PKCS11_KEY **, unsigned int *);
+ 
++/* Get a list of secret keys associated with this token */
++int PKCS11_enumerate_sec_keys(PKCS11_TOKEN *token,
++		PKCS11_KEY **keys, unsigned int *nkeys);
++
+ /* Get the key type (as EVP_PKEY_XXX) */
+ extern int PKCS11_get_key_type(PKCS11_KEY *);
+ 
+diff --git a/src/p11_front.c b/src/p11_front.c
+index f74f209..1459554 100644
+--- a/src/p11_front.c
++++ b/src/p11_front.c
+@@ -208,6 +208,15 @@ int PKCS11_enumerate_public_keys(PKCS11_TOKEN *token,
+ 	return pkcs11_enumerate_keys(slot, CKO_PUBLIC_KEY, keys, nkeys);
+ }
+ 
++int PKCS11_enumerate_sec_keys(PKCS11_TOKEN *token,
++		PKCS11_KEY **keys, unsigned int *nkeys)
++{
++	PKCS11_SLOT_private *slot = PRIVSLOT(token->slot);
++	if (check_slot_fork(slot) < 0)
++		return -1;
++	return pkcs11_enumerate_keys(slot, CKO_SECRET_KEY, keys, nkeys);
++}
++
+ int PKCS11_get_key_type(PKCS11_KEY *pkey)
+ {
+ 	PKCS11_OBJECT_private *key = PRIVKEY(pkey);
+diff --git a/src/p11_key.c b/src/p11_key.c
+index ec7f279..d68005a 100644
+--- a/src/p11_key.c
++++ b/src/p11_key.c
+@@ -106,6 +106,8 @@ PKCS11_OBJECT_private *pkcs11_object_from_handle(PKCS11_SLOT_private *slot,
+ 		if (cert_type != CKC_X_509)
+ 			return 0;
+ 		break;
++	case CKO_SECRET_KEY:
++		break;
+ 	default:
+ 		return NULL;
+ 	}
+-- 
+2.40.1.windows.1
+

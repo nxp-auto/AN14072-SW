@@ -1,0 +1,29 @@
+From 825c633e7692c708d2429b6e749bd0aea83ded98 Mon Sep 17 00:00:00 2001
+From: xuewei wang <xuewei.wang@nxp.com>
+Date: Mon, 20 Mar 2023 11:54:11 +0800
+Subject: [PATCH] Add the case of PKCS1 v1.5 encoding in the function
+ pkcs11_try_pkey_rsa_sign().
+
+---
+ src/p11_pkey.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/p11_pkey.c b/src/p11_pkey.c
+index 56a154d..4752315 100644
+--- a/src/p11_pkey.c
++++ b/src/p11_pkey.c
+@@ -371,6 +371,11 @@ static int pkcs11_try_pkey_rsa_sign(EVP_PKEY_CTX *evp_pkey_ctx,
+ 		mechanism.pParameter = &pss_params;
+ 		mechanism.ulParameterLen = sizeof pss_params;
+ 		break;
++	case RSA_PKCS1_PADDING:
++		mechanism.mechanism = CKM_RSA_PKCS;
++		mechanism.pParameter = NULL;
++		mechanism.ulParameterLen = 0;
++		break;
+ 	default:
+ #ifdef DEBUG
+ 		fprintf(stderr, "%s:%d unsupported padding: %d\n",
+-- 
+2.40.1.windows.1
+
